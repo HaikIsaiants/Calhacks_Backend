@@ -1,0 +1,6 @@
+letta
+python-dotenv
+pydantic
+pandas
+biopython
+pytest
