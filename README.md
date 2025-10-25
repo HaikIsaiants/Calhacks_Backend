@@ -5,6 +5,17 @@
 
 ## Dev server (demo endpoints)
 
-- Start API: `uvicorn app:app --reload`
+- Quick start: `python run.py` (loads `.env`, starts Uvicorn with reload)
+- Or start directly: `uvicorn app:app --reload`
 - Health check: `GET /health`
-- Button hook (no-op): `POST /api/letta/create` (accepts optional `{ "notebookId": "..." }`, just logs and returns `{ ok: true }`).
+- Create from template: `POST /api/letta/create` (accepts optional `{ "notebookId": "..." }`).
+  - If env vars are set, this will create a fresh Letta agent from your template and return `{ agentId }`.
+  - If not configured, it returns an acknowledgement only.
+
+### Environment
+
+Set these in `.env` (or export before running):
+
+- `LETTA_API_KEY` – your Letta API token
+- `LETTA_PROJECT` – project slug (default: `default-project`)
+- `LETTA_TEMPLATE_VERSION` – template version slug, e.g. `clever-jade-worm:latest`
