@@ -1,11 +1,12 @@
 import os
 import time
+import json
 import logging
 from typing import Optional, Dict, Any, Iterable
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CreatePayload(BaseModel):
@@ -44,6 +45,7 @@ except Exception:  # library not installed or optional
 LETTA_TOKEN = os.getenv("LETTA_API_KEY") or os.getenv("LETTA_TOKEN")
 LETTA_PROJECT = os.getenv("LETTA_PROJECT", "default-project")
 LETTA_TEMPLATE_VERSION = os.getenv("LETTA_TEMPLATE_VERSION")  # e.g., "clever-jade-worm:latest"
+LETTA_API_BASE = os.getenv("LETTA_API_BASE", "https://api.letta.com")
 
 _client = None
 if Letta and LETTA_TOKEN:
@@ -53,6 +55,9 @@ if Letta and LETTA_TOKEN:
     except Exception as e:
         logger.warning("Letta client init failed: %s", e)
         _client = None
+
+
+_latest_agent_id: Optional[str] = None
 
 
 def _extract_agent_id(resp: Any) -> Optional[str]:  # type: ignore[name-defined]
@@ -132,6 +137,7 @@ async def letta_create(payload: CreatePayload, request: Request):
     the event and returns an OK response so the frontend knows the click
     was received. Later, wire real Letta agent creation here.
     """
+    global _latest_agent_id
     client_ip = request.client.host if request.client else None
     ua = request.headers.get("user-agent", "")
     logger.info(
@@ -148,7 +154,7 @@ async def letta_create(payload: CreatePayload, request: Request):
             import httpx  # local import to avoid hard dependency at import-time
 
             base_url = os.getenv("LETTA_API_BASE", "https://api.letta.com")
-            url = f"{base_url}/v1/templates/{LETTA_PROJECT}/{LETTA_TEMPLATE_VERSION}/agents"
+            url = f"{LETTA_API_BASE}/v1/templates/{LETTA_PROJECT}/{LETTA_TEMPLATE_VERSION}/agents"
             headers = {
                 "Authorization": f"Bearer {LETTA_TOKEN}",
                 "Accept": "application/json",
@@ -188,6 +194,8 @@ async def letta_create(payload: CreatePayload, request: Request):
             if not agent_id:
                 raise RuntimeError("No agent id returned from Letta")
 
+            _latest_agent_id = agent_id
+
             logger.info(
                 "letta.create agent created | notebookId=%s agentId=%s",
                 payload.notebookId,
@@ -207,9 +215,77 @@ async def letta_create(payload: CreatePayload, request: Request):
             raise HTTPException(status_code=502, detail=f"Letta error: {e}")
 
     # Fallback: acknowledge only (no Letta configured yet)
+    _latest_agent_id = None
     return {
         "ok": True,
         "event": "letta.create.received",
         "ts": int(time.time()),
         "notebookId": payload.notebookId,
+    }
+
+
+def _send_notebook_to_letta(agent_id: str, payload: Dict[str, Any]) -> None:
+    message = "NOTEBOOK:\n" + json.dumps(payload, indent=2, ensure_ascii=False)
+    data = {"messages": [{"role": "user", "content": message}]}
+    headers = {
+        "Authorization": f"Bearer {LETTA_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    import httpx
+
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(
+            f"{LETTA_API_BASE}/v1/agents/{agent_id}/messages",
+            json=data,
+            headers=headers,
+        )
+    resp.raise_for_status()
+
+
+class NotebookSavePayload(BaseModel):
+    savedAt: str = Field(..., description="ISO timestamp of the save event")
+    report: Optional[str] = None
+    changes: Optional[Dict[str, Any]] = None
+    snapshot: Optional[Dict[str, Any]] = None
+    agentId: Optional[str] = None
+    notebookId: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/notebook/save")
+async def notebook_save(payload: NotebookSavePayload):
+    """Receive the notebook delta + snapshot and log it for now."""
+
+    dump = payload.model_dump(exclude_none=True)
+    logger.info(
+        "notebook.save received | notebookId=%s agentId=%s savedAt=%s",
+        dump.get("notebookId"),
+        dump.get("agentId"),
+        dump.get("savedAt"),
+    )
+    if payload.report:
+        logger.info("notebook.save report:\n%s", payload.report)
+    logger.info(
+        "notebook.save payload:\n%s",
+        json.dumps(dump, indent=2, ensure_ascii=False),
+    )
+
+    forwarded = False
+    if LETTA_TOKEN and _latest_agent_id:
+        try:
+            _send_notebook_to_letta(_latest_agent_id, dump)
+            forwarded = True
+            logger.info(
+                "notebook.save forwarded to Letta | agentId=%s",
+                _latest_agent_id,
+            )
+        except Exception as err:
+            logger.exception("Failed to forward notebook save to Letta: %s", err)
+
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "received": dump,
+        "forwarded": forwarded,
     }

@@ -11,6 +11,7 @@
 - Create from template: `POST /api/letta/create` (accepts optional `{ "notebookId": "..." }`).
   - If env vars are set, this will create a fresh Letta agent from your template and return `{ agentId }`.
   - If not configured, it returns an acknowledgement only.
+- Save hook (demo logging only): `POST /api/notebook/save`
 
 ### Environment
 
