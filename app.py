@@ -258,6 +258,7 @@ async def notebook_save(payload: NotebookSavePayload):
     """Receive the notebook delta + snapshot and log it for now."""
 
     dump = payload.model_dump(exclude_none=True)
+    pretty = json.dumps(dump, indent=2, ensure_ascii=False)
     logger.info(
         "notebook.save received | notebookId=%s agentId=%s savedAt=%s",
         dump.get("notebookId"),
@@ -268,8 +269,15 @@ async def notebook_save(payload: NotebookSavePayload):
         logger.info("notebook.save report:\n%s", payload.report)
     logger.info(
         "notebook.save payload:\n%s",
-        json.dumps(dump, indent=2, ensure_ascii=False),
+        pretty,
     )
+
+    # overwrite log.md with the latest JSON snapshot
+    try:
+        with open("log.md", "w", encoding="utf-8") as f:
+            f.write(pretty)
+    except Exception as write_err:
+        logger.warning("Failed to write log.md: %s", write_err)
 
     forwarded = False
     if LETTA_TOKEN and _latest_agent_id:
