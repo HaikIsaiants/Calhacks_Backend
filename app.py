@@ -2,11 +2,12 @@ import os
 import time
 import json
 import logging
+import httpx
 from typing import Optional, Dict, Any, Iterable, List, Literal
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 
 
 class CreatePayload(BaseModel):
@@ -20,6 +21,13 @@ def _origin_list(val: Optional[str]):
     return [v.strip() for v in val.split(",") if v.strip()]
 
 
+class TextWithSources(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = Field(...)
+    source_ids: Optional[List[str]] = Field(default=None)
+
+
 class GraphNode(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -31,9 +39,29 @@ class GraphNode(BaseModel):
     isEdited: bool = Field(
         False, description="Flag to highlight the edited protein in the graph"
     )
-    notes: Optional[str] = Field(
+    notes: Optional[TextWithSources] = Field(
         None, description="Optional context about the node or its role"
     )
+    relationship_to_edited: Optional[TextWithSources] = Field(
+        None, description="Relationship to the edited protein"
+    )
+    role_summary: Optional[TextWithSources] = Field(
+        None, description="Brief summary of the node's role"
+    )
+    source_ids: Optional[List[str]] = Field(
+        default=None, description="Optional list of sources associated with this node"
+    )
+
+    @field_validator("notes", "relationship_to_edited", "role_summary", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: Any):
+        if value is None or isinstance(value, TextWithSources):
+            return value
+        if isinstance(value, str):
+            return {"text": value}
+        if isinstance(value, dict):
+            return value
+        raise TypeError("Expected string, dict, or TextWithSources-compatible value")
 
 
 class GraphEdge(BaseModel):
@@ -84,10 +112,10 @@ class EditedProtein(BaseModel):
 
     id: str = Field(..., description="Node id for the edited protein")
     label: str = Field(..., description="Short name/acronym for the edited protein")
-    description: Optional[str] = Field(
+    description: Optional[TextWithSources] = Field(
         None, description="Brief note describing the edit"
     )
-    mutations: List[str] = Field(
+    mutations: List[TextWithSources] = Field(
         default_factory=list, description="List of mutations included in the edit"
     )
     confidence: Optional[float] = Field(
@@ -101,7 +129,7 @@ class EditedProtein(BaseModel):
 class NotebookAnalysisResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    analysis_summary: str = Field(
+    analysis_summary: TextWithSources = Field(
         ..., description="Plain-English summary of the notebook analysis"
     )
     edited_protein: EditedProtein = Field(
@@ -224,6 +252,15 @@ def _find_analysis_like_dict(obj: Any) -> Optional[Dict[str, Any]]:
     Looks for a dict with keys resembling our schema: 'graph' with 'nodes'/'edges',
     plus 'analysis_summary' and 'edited_protein'. Recurses into lists/dicts.
     """
+
+    def _has_text_payload(val: Any) -> bool:
+        if isinstance(val, str):
+            return True
+        if isinstance(val, dict):
+            text_val = val.get("text")
+            return isinstance(text_val, str) and text_val.strip() != ""
+        return False
+
     try:
         if isinstance(obj, dict):
             g = obj.get("graph")
@@ -231,7 +268,7 @@ def _find_analysis_like_dict(obj: Any) -> Optional[Dict[str, Any]]:
                 isinstance(g, dict)
                 and isinstance(g.get("nodes"), list)
                 and isinstance(g.get("edges"), list)
-                and isinstance(obj.get("analysis_summary"), str)
+                and _has_text_payload(obj.get("analysis_summary"))
                 and isinstance(obj.get("edited_protein"), dict)
             ):
                 return obj
@@ -491,9 +528,6 @@ async def letta_create(payload: CreatePayload, request: Request):
     # Use the REST API directly to reliably capture the created agent id.
     if LETTA_TOKEN and LETTA_TEMPLATE_VERSION:
         try:
-            import httpx  # local import to avoid hard dependency at import-time
-
-            base_url = os.getenv("LETTA_API_BASE", "https://api.letta.com")
             url = f"{LETTA_API_BASE}/v1/templates/{LETTA_PROJECT}/{LETTA_TEMPLATE_VERSION}/agents"
             headers = {
                 "Authorization": f"Bearer {LETTA_TOKEN}",
@@ -501,16 +535,14 @@ async def letta_create(payload: CreatePayload, request: Request):
                 "Content-Type": "application/json",
             }
 
-            # Create the agent from the template and capture the id
-            with httpx.Client(timeout=30) as client:
-                r = client.post(url, json={}, headers=headers)
-
-            r.raise_for_status()
+            with httpx.Client(timeout=120) as client:
+                resp = client.post(url, json={}, headers=headers)
+            resp.raise_for_status()
 
             agent_id: Optional[str] = None
             # Prefer JSON body
             try:
-                data = r.json()
+                data = resp.json()
             except Exception:
                 data = None
             if isinstance(data, dict):
@@ -525,7 +557,7 @@ async def letta_create(payload: CreatePayload, request: Request):
 
             # Fallback to Location header (…/agents/agent-xxxx)
             if not agent_id:
-                loc = r.headers.get("Location") or r.headers.get("location")
+                loc = resp.headers.get("Location") or resp.headers.get("location")
                 if loc:
                     part = loc.rstrip("/").split("/")[-1]
                     if part.startswith("agent-"):
@@ -572,9 +604,7 @@ def _send_notebook_to_letta(agent_id: str, payload: Dict[str, Any]) -> None:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    import httpx
-
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=1200) as client:
         resp = client.post(
             f"{LETTA_API_BASE}/v1/agents/{agent_id}/messages",
             json=data,
@@ -593,8 +623,6 @@ async def letta_analyze(request: Request):
     - If the reply parses and validates against NotebookAnalysisResult, it is stored
       and returned verbatim in the response.
     """
-    import httpx
-
     agent_id = request.query_params.get("agentId") or _latest_agent_id
     if not (LETTA_TOKEN and agent_id):
         raise HTTPException(status_code=400, detail="Agent not configured or missing")
@@ -606,62 +634,112 @@ async def letta_analyze(request: Request):
     }
     body = {"messages": [{"role": "user", "content": "ANALYZE"}]}
 
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
+    # Kick off the analysis and capture the run id
+    with httpx.Client(timeout=120) as client:
+        start_resp = client.post(
             f"{LETTA_API_BASE}/v1/agents/{agent_id}/messages",
             json=body,
             headers=headers,
         )
-    r.raise_for_status()
+    start_resp.raise_for_status()
 
-    # Try JSON first, then text
-    raw_body_text: Optional[str] = None
     try:
-        raw_body_text = r.text
-    except Exception:
-        raw_body_text = None
+        start_payload = start_resp.json()
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"Invalid Letta response: {err}")
+
     try:
-        resp_json = r.json()
+        logger.info("letta.analyze start payload: %s", json.dumps(start_payload, indent=2))
     except Exception:
-        resp_json = None
+        logger.info("letta.analyze start payload (raw): %s", start_payload)
 
-    # Log what we received to debug schema mismatches
-    _debug_log_letta_response(resp_json, raw_body_text)
+    # Try to extract the analysis directly from the initial response
+    analysis_payload: Optional[Dict[str, Any]] = None
+    analysis_payload = _extract_json_from_messages(start_payload)
+    if analysis_payload is None:
+        analysis_payload = _find_analysis_like_dict(start_payload)
 
-    data: Optional[Dict[str, Any]] = None
-    if isinstance(resp_json, dict):
-        data = _extract_json_from_messages(resp_json)
-    if data is None and raw_body_text:
-        try:
-            candidate = json.loads(raw_body_text)
-            if isinstance(candidate, dict):
-                data = _extract_json_from_messages(candidate) or _find_analysis_like_dict(candidate)
-        except Exception:
-            data = None
+    if analysis_payload is None:
+        # Fallback: poll Letta for completion when the initial payload doesn't contain the final JSON.
+        run_id: Optional[str] = None
+        if isinstance(start_payload, dict):
+            run_id = (
+                start_payload.get("run_id")
+                or start_payload.get("id")
+                or start_payload.get("message_id")
+            )
+            if not run_id:
+                data_block = start_payload.get("data")
+                if isinstance(data_block, dict):
+                    run_id = (
+                        data_block.get("run_id")
+                        or data_block.get("id")
+                        or data_block.get("message_id")
+                    )
 
-    if data is None:
-        # Final fallback: try extracting assistant text and parsing as JSON
-        text = _extract_assistant_text(resp_json or {}) if isinstance(resp_json, dict) else None
-        if text:
+        if not isinstance(run_id, str):
+            raise HTTPException(status_code=502, detail="Letta response missing run id")
+
+        poll_interval = 3.0
+        deadline = time.time() + 1200
+        status_url = f"{LETTA_API_BASE}/v1/runs/{run_id}"
+        messages_url = f"{LETTA_API_BASE}/v1/runs/{run_id}/messages"
+
+        while time.time() < deadline:
             try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    data = parsed
-            except Exception:
-                pass
+                with httpx.Client(timeout=120) as client:
+                    status_resp = client.get(status_url, headers=headers)
+                status_resp.raise_for_status()
+                status_data = status_resp.json()
+                logger.info("letta.analyze poll state: %s", status_data)
+            except Exception as poll_exc:
+                logger.warning("letta.analyze poll failed: %s", poll_exc)
+                time.sleep(poll_interval)
+                continue
 
-    if data is None:
-        raise HTTPException(status_code=502, detail="No JSON analysis found in Letta response")
+            state = None
+            if isinstance(status_data, dict):
+                state = status_data.get("state") or status_data.get("status")
+            if isinstance(state, str):
+                state = state.lower()
+
+            if state in {"completed", "finished", "succeeded"}:
+                try:
+                    with httpx.Client(timeout=120) as client:
+                        messages_resp = client.get(messages_url, headers=headers)
+                    messages_resp.raise_for_status()
+                    messages_data = messages_resp.json()
+                    try:
+                        logger.info(
+                            "letta.analyze messages payload: %s",
+                            json.dumps(messages_data, indent=2),
+                        )
+                    except Exception:
+                        logger.info("letta.analyze messages payload (raw): %s", messages_data)
+                    analysis_payload = _extract_json_from_messages(messages_data)
+                    if analysis_payload is None:
+                        analysis_payload = _find_analysis_like_dict(messages_data)
+                except Exception as fetch_exc:
+                    raise HTTPException(status_code=502, detail=f"Failed to fetch analysis: {fetch_exc}")
+                break
+
+            if state in {"failed", "error"}:
+                raise HTTPException(status_code=502, detail="Letta reported run failure")
+
+            time.sleep(poll_interval)
+
+        if analysis_payload is None:
+            raise HTTPException(status_code=504, detail="Letta analysis timed out")
 
     try:
-        validated = NotebookAnalysisResult.model_validate(data)
+        validated = NotebookAnalysisResult.model_validate(analysis_payload)
     except Exception as e:
-        logger.warning("Validation failed for analysis: %s | keys=%s", e, list(data.keys()))
+        logger.warning("Validation failed for analysis: %s | keys=%s", e, list(analysis_payload.keys()))
         raise HTTPException(status_code=422, detail=f"Analysis failed validation: {e}")
 
     _store_analysis_result(validated, source="letta.analyze")
 
-    return {"ok": True, "analysis": data, "ts": int(time.time())}
+    return {"ok": True, "analysis": analysis_payload, "ts": int(time.time())}
 
 
 class NotebookSavePayload(BaseModel):
